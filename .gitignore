@@ -1,0 +1,17 @@
+# Mjedisi virtual
+venv/
+.venv/
+env/
+
+# PyInstaller / Build outputs
+build/
+dist/
+*.spec
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Skedarët e IDE / Editorëve
+.vscode/
+.idea/

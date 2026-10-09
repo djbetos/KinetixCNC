@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from config.config_manager import ConfigManager
+from ui.jog_mpg_dialog import JogMPGDialog
 from ui.motion_controller_dialog import MotionControllerDialog
 from ui.profile_selector import ProfileSelectorDialog
 from ui.setup_dialog import SetupDialog
@@ -40,7 +41,17 @@ class GCodeVisualizer3D(QWidget):
     super().__init__(parent)
     self.lines = []
     self.view_mode = "XY"
+    self.tool_x = 0.0
+    self.tool_y = 0.0
+    self.tool_z = 0.0
     self.setMinimumSize(400, 400)
+
+  def update_tool_position(self, x: float, y: float, z: float):
+    """Përditëson pozicionin e kokës së veglës në vizualizues."""
+    self.tool_x = x
+    self.tool_y = y
+    self.tool_z = z
+    self.update()
 
   def set_gcode(self, gcode_text):
     self.lines = []
@@ -124,7 +135,34 @@ class MainWindow(QMainWindow):
     self.cfg = ConfigManager(profile_name)
     self.selected_controller = self.cfg.get_motion_controller_type()
 
-    self.setWindowTitle(f"Kinetix CNC - Ether-MCI | Profile: [{profile_name}]")
+    # Gjendjet e sistemit
+    self.is_enabled = False
+    self.estop_active = True  # Default E-Stop aktiv
+    self.blink_state = False
+
+    # Timer për efektin e pulsimit të butonit Enable (Green / Red)
+    self.blink_timer = QTimer(self)
+    self.blink_timer.setInterval(500)  # Ndërron çdo 500ms
+    self.blink_timer.timeout.connect(self._toggle_enable_button_blink)
+
+    # Deklarimi i atributeve për të parandaluar paralajmërimet e Pylance
+    self.axis_positions = {
+        "X": 0.0,
+        "Y": 0.0,
+        "Z": 0.0,
+        "A": 0.0,
+        "B": 0.0,
+        "C": 0.0,
+    }
+    self.motion_controller = None
+    self.jog_dialog = None
+    self.visualizer = None
+    self.dro_labels = {}
+    self.axis_widgets = {}
+
+    self.setWindowTitle(
+        f"Kinetix CNC - Ether-MCI | Profile: [{profile_name}]"
+    )
     self.resize(1400, 850)
 
     # Stili Dark Industrial (QSS)
@@ -175,13 +213,173 @@ class MainWindow(QMainWindow):
     # Status Bar në fund
     self.status_bar = QStatusBar()
     self.setStatusBar(self.status_bar)
-    self.status_bar.showMessage(
-        "Connected. DEMO-MC firmware version: 01.00                       "
-        "                               Tool:0, Fix:1, CV:ON | Mode: SAFE, b:0"
-    )
+
+    # Lidhja e butonit Enable
+    if hasattr(self, "btn_enable"):
+      self.btn_enable.clicked.connect(self.toggle_enable_state)
+
+    # Përditësojmë gjendjen e ndërfaqes për Enable / ESTOP
+    self.update_enable_ui_state()
 
   # -------------------------------------------------------------------------
-  # STRUKTURA E MENYSË KRYESORE ME EMBLEMËN E BIZNESIT NË TË DJATHTË
+  # LOGJIKA E ENABLE / DISABLE / ESTOP & OUTPUT PIN 24
+  # -------------------------------------------------------------------------
+  def _toggle_enable_button_blink(self):
+    """Bën pulsimin e kornizës së butonit Enable (Kuq / Gjelbër) kur është në ESTOP."""
+    self.blink_state = not self.blink_state
+    border_color = "#00FF00" if self.blink_state else "#FF0000"
+
+    if hasattr(self, "btn_enable"):
+      self.btn_enable.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: #2D2D30;
+                    color: #FFFFFF;
+                    border: 2px solid {border_color};
+                    border-radius: 4px;
+                    font-size: 12px;
+                    font-weight: bold;
+                    height: 32px;
+                }}
+                QPushButton:hover {{
+                    background-color: #3E3E42;
+                }}
+            """)
+
+  def update_enable_ui_state(self):
+    """Përditëson ndërfaqen sipas gjendjeve Enable/Disable."""
+    if self.is_enabled:
+      self.blink_timer.stop()
+
+      if hasattr(self, "btn_enable"):
+        self.btn_enable.setText("Disable")
+        self.btn_enable.setStyleSheet("""
+                    QPushButton {
+                        background-color: #2D2D30;
+                        color: #FFFFFF;
+                        border: 2px solid #00FF00;
+                        border-radius: 4px;
+                        font-size: 12px;
+                        font-weight: bold;
+                        height: 32px;
+                    }
+                """)
+
+      self.status_bar.showMessage("Connected. ETH-MCI firmware version: 00.58")
+      self.set_output_pin_state("Enable", pin_number=24, state=True)
+
+    else:
+      if hasattr(self, "btn_enable"):
+        self.btn_enable.setText("Enable")
+
+      if not self.blink_timer.isActive():
+        self.blink_timer.start()
+
+      self.status_bar.showMessage("ESTOP for reconfiguration.")
+      self.set_output_pin_state("Enable", pin_number=24, state=False)
+
+  def toggle_enable_state(self):
+    """Shtypja e butonit Enable/Disable."""
+    if not self.is_enabled and self.check_hardware_estop():
+      QMessageBox.critical(
+          self,
+          "E-Stop i Shtypur",
+          "Nuk mund të aktivizohet makina sepse butoni fizik E-Stop është i"
+          " shtypur!\n\nLirojeni butonin E-Stop te makina dhe provoni"
+          " përsëri.",
+      )
+      return
+
+    self.is_enabled = not self.is_enabled
+    self.update_enable_ui_state()
+
+  def check_hardware_estop(self) -> bool:
+    """Lexon nëse butoni fizik E-Stop (Input Pin 1) është aktiv."""
+    if self.motion_controller is not None and hasattr(
+        self.motion_controller, "get_input_pin"
+    ):
+      return self.motion_controller.get_input_pin(1) == 1
+    return self.estop_active
+
+  def set_output_pin_state(
+      self, signal_name: str, pin_number: int, state: bool
+  ):
+    """Ndez ose ndal pinit e daljes (Pin 24 për Enable Relay)."""
+    print(
+        f"[HARDWARE OUTPUT] Signal: {signal_name} | Pin: {pin_number} | State:"
+        f" {'HIGH (1)' if state else 'LOW (0)'}"
+    )
+    if self.motion_controller is not None and hasattr(
+        self.motion_controller, "set_output_pin"
+    ):
+      self.motion_controller.set_output_pin(pin_number, 1 if state else 0)
+
+  # -------------------------------------------------------------------------
+  # JOG & MPG DIALOG HANDLERS
+  # -------------------------------------------------------------------------
+  def action_open_jog_mpg_window(self):
+    if self.jog_dialog is None:
+      self.jog_dialog = JogMPGDialog(
+          config_manager=self.cfg, parent=self
+      )
+
+      self.jog_dialog.jog_started.connect(self.handle_jog_start)
+      self.jog_dialog.jog_stopped.connect(self.handle_jog_stop)
+      self.jog_dialog.jog_mode_changed.connect(self.handle_jog_mode_changed)
+      self.jog_dialog.mpg_axis_changed.connect(self.handle_mpg_axis_changed)
+
+    self.jog_dialog.show()
+    self.jog_dialog.raise_()
+    self.jog_dialog.activateWindow()
+
+  def handle_jog_start(self, axis: str, direction: int):
+    """Ekzekutohet kur shtypet një nga butonat e lëvizjes."""
+    if self.jog_dialog is None or not self.is_enabled:
+      return
+
+    mode = self.jog_dialog.modes[self.jog_dialog.current_mode_index]
+    step_size = float(self.jog_dialog.txt_jog_step.text() or 0.01)
+    slow_jog = float(self.jog_dialog.txt_slow_jog.text() or 100)
+
+    if axis in self.axis_positions:
+      self.axis_positions[axis] += step_size * direction
+      self.update_dro_display(axis, self.axis_positions[axis])
+
+    if self.motion_controller is not None and hasattr(
+        self.motion_controller, "start_jog"
+    ):
+      self.motion_controller.start_jog(
+          axis, direction, mode, step_size, slow_jog
+      )
+
+  def handle_jog_stop(self, axis: str):
+    """Ekzekutohet kur lëshohet butoni i lëvizjes."""
+    if self.motion_controller is not None and hasattr(
+        self.motion_controller, "stop_jog"
+    ):
+      self.motion_controller.stop_jog(axis)
+
+  def handle_jog_mode_changed(self, mode: str):
+    print(f"[JOG MODE] U ndryshua në: {mode}")
+
+  def handle_mpg_axis_changed(self, axis: str):
+    print(f"[MPG AXIS] U zgjodh aks: {axis}")
+
+  def update_dro_display(self, axis: str, value: float):
+    """Përditëson shfaqjen e koordinatave në UI (DRO)."""
+    formatted_val = f"{value:+0.4f}"
+
+    if axis in self.dro_labels:
+      self.dro_labels[axis].setText(formatted_val)
+
+    if self.visualizer is not None:
+      self.visualizer.update_tool_position(
+          self.axis_positions.get("X", 0.0),
+          self.axis_positions.get("Y", 0.0),
+          self.axis_positions.get("Z", 0.0),
+      )
+
+  # -------------------------------------------------------------------------
+  # STRUKTURA E MENYSË KRYESORE
   # -------------------------------------------------------------------------
   def create_menu_bar(self):
     menu_bar = self.menuBar()
@@ -278,7 +476,9 @@ class MainWindow(QMainWindow):
 
     view_menu.addSeparator()
     view_menu.addAction("IO Diagnostics")
-    view_menu.addAction("Jog & MPG window")
+    act_jog_mpg_window = QAction("Jog & MPG window", self)
+    act_jog_mpg_window.triggered.connect(self.action_open_jog_mpg_window)
+    view_menu.addAction(act_jog_mpg_window)
     view_menu.addAction("Tool Offsets Window")
     view_menu.addAction("Macro log window")
 
@@ -315,23 +515,21 @@ class MainWindow(QMainWindow):
     lbl_input = QLabel("Biznesi:")
     lbl_input.setStyleSheet("color: #AAAAAA; font-size: 11px;")
 
-    # TextBox ku shkruan emrin (p.sh. Euro-Model)
     self.txt_business_name = QLineEdit()
     self.txt_business_name.setPlaceholderText("p.sh. Euro-Model")
     self.txt_business_name.setFixedWidth(130)
     self.txt_business_name.setStyleSheet("""
-        QLineEdit {
-            background-color: #252526;
-            color: #007ACC;
-            border: 1px solid #007ACC;
-            border-radius: 3px;
-            padding: 2px 5px;
-            font-size: 11px;
-            font-weight: bold;
-        }
-    """)
+            QLineEdit {
+                background-color: #252526;
+                color: #007ACC;
+                border: 1px solid #007ACC;
+                border-radius: 3px;
+                padding: 2px 5px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+        """)
 
-    # Lidhja me funksionin që përditëson direkt Title Bar-in sipër
     self.txt_business_name.textChanged.connect(self.update_brand_label)
 
     right_layout.addWidget(lbl_input)
@@ -340,16 +538,16 @@ class MainWindow(QMainWindow):
     menu_bar.setCornerWidget(right_widget, Qt.Corner.TopRightCorner)
 
   def update_brand_label(self, text):
-      """Përditëson titullin në Titullin e Dritares (Title Bar) sipas shkrimit në TextBox."""
-      text = text.strip()
-      if text:
-        self.setWindowTitle(
-            f"Kinetix CNC - {text} - Ether-MCI | Profile: [{self.profile_name}]"
-        )
-      else:
-        self.setWindowTitle(
-            f"Kinetix CNC - Ether-MCI | Profile: [{self.profile_name}]"
-        )
+    """Përditëson titullin në Titullin e Dritares (Title Bar) sipas shkrimit në TextBox."""
+    text = text.strip()
+    if text:
+      self.setWindowTitle(
+          f"Kinetix CNC - {text} | Profile: [{self.profile_name}]"
+      )
+    else:
+      self.setWindowTitle(
+          f"Kinetix CNC - Ether-MCI | Profile: [{self.profile_name}]"
+      )
 
   # -------------------------------------------------------------------------
   # PANELI 1: MAJTAS (G-CODE, RUNTIME STATUS & KONTROLLET)
@@ -411,22 +609,48 @@ class MainWindow(QMainWindow):
     btn_rewind = QPushButton("Rewind")
     btn_rewind.setStyleSheet("height: 32px;")
 
-    btn_enable = QPushButton("Enable")
-    btn_enable.setStyleSheet(
-        "background-color: #d9534f; color: white; height: 32px; font-size:"
-        " 12px;"
-    )
+    self.btn_enable = QPushButton("Enable")
 
     btn_grid.addWidget(btn_start, 0, 0)
     btn_grid.addWidget(btn_stop, 0, 1)
     btn_grid.addWidget(btn_feedhold, 0, 2)
     btn_grid.addWidget(btn_rewind, 0, 3)
-    btn_grid.addWidget(btn_enable, 1, 0, 1, 2)
+    btn_grid.addWidget(self.btn_enable, 1, 0, 1, 2)
+
+    radio_style = """
+            QRadioButton {
+                color: #FFFFFF;
+                font-size: 12px;
+                font-weight: 500;
+            }
+            QRadioButton::indicator {
+                width: 14px;
+                height: 14px;
+                border-radius: 8px;
+                border: 2px solid #FFFFFF;
+                background-color: transparent;
+            }
+            QRadioButton::indicator:checked {
+                background-color: #007ACC;
+                border: 2px solid #FFFFFF;
+            }
+        """
 
     ind_layout = QVBoxLayout()
-    ind_layout.addWidget(QRadioButton("Tool change"))
-    ind_layout.addWidget(QRadioButton("Coolant"))
-    ind_layout.addWidget(QRadioButton("Dwell"))
+
+    self.rb_tool = QRadioButton("Tool change")
+    self.rb_tool.setStyleSheet(radio_style)
+
+    self.rb_coolant = QRadioButton("Coolant")
+    self.rb_coolant.setStyleSheet(radio_style)
+
+    self.rb_dwell = QRadioButton("Dwell")
+    self.rb_dwell.setStyleSheet(radio_style)
+
+    ind_layout.addWidget(self.rb_tool)
+    ind_layout.addWidget(self.rb_coolant)
+    ind_layout.addWidget(self.rb_dwell)
+
     btn_grid.addLayout(ind_layout, 1, 2, 1, 2)
 
     left_layout.addLayout(btn_grid)
@@ -441,9 +665,6 @@ class MainWindow(QMainWindow):
 
     dro_box = QGroupBox("DRO (KOORDINATAT)")
     dro_layout = QVBoxLayout()
-
-    self.axis_widgets = {}
-    self.dro_labels = {}
 
     axes = ["X", "Y", "Z", "A", "B", "C"]
     colors = ["#FF5555", "#55FF55", "#5599FF", "#FFAA00", "#AA55FF", "#00AAAA"]
@@ -525,7 +746,7 @@ class MainWindow(QMainWindow):
     return mid_layout
 
   # -------------------------------------------------------------------------
-  # PANELI 3: DJATHTAS (VISUALIZUER 3D & MDI COMMANDS)
+  # PANELI 3: DJATHTAS (VISUALIZER 3D & MDI COMMANDS)
   # -------------------------------------------------------------------------
   def create_right_visualizer_panel(self):
     right_layout = QVBoxLayout()
@@ -539,6 +760,8 @@ class MainWindow(QMainWindow):
       btn_v = QPushButton(view_name)
       btn_v.clicked.connect(
           lambda _, m=view_name: self.visualizer.set_view_mode(m)
+          if self.visualizer is not None
+          else None
       )
       views_layout.addWidget(btn_v)
 
@@ -614,17 +837,33 @@ class MainWindow(QMainWindow):
     )
 
     if dlg.exec() == QDialog.DialogCode.Accepted:
-      selected_controller, new_ip = dlg.get_selected_data()
-      self.selected_controller = selected_controller
-      self.cfg.set_motion_controller_ip(new_ip)
-      self.cfg.set_motion_controller_type(selected_controller)
+      data = dlg.get_selected_data()
 
-      QMessageBox.information(
-          self,
-          "Konfigurimi u Ruajt",
-          f"U ruajt me sukses!\n\nKontrolluesi: {selected_controller}\nIP"
-          f" Adresa: {new_ip}",
+      controller_type = data["type_id"]  # p.sh. "2"
+      new_ip_hex = data["ip_hex"]  # p.sh. "C0A801DE"
+
+      controller_name = data["controller_name"]
+      display_ip = data["ip_str"]
+
+      self.selected_controller = controller_type
+
+      self.cfg.set_motion_controller_type(controller_type)
+      self.cfg.set_motion_controller_ip(new_ip_hex)
+
+      msg = QMessageBox(self)
+      msg.setIcon(QMessageBox.Icon.Information)
+      msg.setWindowTitle("Konfigurimi u Ruajt")
+      msg.setText("U ruajt me sukses!")
+      msg.setInformativeText(
+          f"Kontrolluesi: {controller_name} (Type={controller_type})\n"
+          f"IP Adresa: {display_ip} (IP={new_ip_hex})"
       )
+      msg.setStyleSheet("""
+                QMessageBox { background-color: #1E1E1E; }
+                QMessageBox QLabel { color: #FFFFFF !important; font-size: 13px; }
+                QPushButton { background-color: #007ACC; color: white; border-radius: 4px; padding: 5px 15px; }
+            """)
+      msg.exec()
 
   def action_open_setup_dialog(self):
     dlg = SetupDialog(self.cfg, parent=self)
@@ -638,12 +877,19 @@ class MainWindow(QMainWindow):
 
       self.update_axis_visibility()
 
-      QMessageBox.information(
-          self,
-          "Setup",
-          "Konfigurimet nga dritarja Setup u ruajtën me sukses në profilin"
-          f" [{self.profile_name}.ini]!",
+      msg = QMessageBox(self)
+      msg.setIcon(QMessageBox.Icon.Information)
+      msg.setWindowTitle("Setup")
+      msg.setText(
+          "Konfigurimet nga dritarja Setup u ruajtën me sukses në"
+          f" profilin [{self.profile_name}.ini]!"
       )
+      msg.setStyleSheet("""
+                QMessageBox { background-color: #1E1E1E; }
+                QMessageBox QLabel { color: #FFFFFF !important; font-size: 13px; }
+                QPushButton { background-color: #007ACC; color: white; border-radius: 4px; padding: 5px 15px; }
+            """)
+      msg.exec()
 
   def action_load_gcode(self):
     file_name, _ = QFileDialog.getOpenFileName(
@@ -657,27 +903,55 @@ class MainWindow(QMainWindow):
         with open(file_name, "r", encoding="utf-8", errors="ignore") as f:
           content = f.read()
           self.txt_gcode.setPlainText(content)
-          self.visualizer.set_gcode(content)
+          if self.visualizer is not None:
+            self.visualizer.set_gcode(content)
       except Exception as e:
         QMessageBox.critical(
             self, "Gabim", f"E pamundur të hapet skedari: {str(e)}"
         )
 
   def action_ref_all_home(self):
-    QMessageBox.information(
-        self,
-        "Ref All Home",
-        "Po ekzekutohet homing për të gjitha akset e aktivizuara...",
+    msg = QMessageBox(self)
+    msg.setIcon(QMessageBox.Icon.Information)
+    msg.setWindowTitle("Ref All Home")
+    msg.setInformativeText(
+        "Po ekzekutohet homing për të gjitha akset e aktivizuara..."
     )
+    msg.exec()
 
   def action_show_about(self):
-    QMessageBox.about(
-        self,
-        "Rreth Kinetix CNC",
-        f"<b>Kinetix CNC Controller</b><br>Hardware Support: Ether-MCI"
+    msg = QMessageBox(self)
+    msg.setIcon(QMessageBox.Icon.Information)
+    msg.setWindowTitle("Rreth Kinetix CNC")
+    msg.setText(
+        "<b>Kinetix CNC Controller</b><br>Hardware Support: Ether-MCI"
         f" Controller<br>Profili i Aktivizuar: <b>{self.profile_name}</b><br><br>Zhvilluar"
-        " me PySide6 (Qt6).",
+        " me PySide6 (Qt6)."
     )
+
+    msg.setStyleSheet("""
+            QMessageBox {
+                background-color: #1E1E1E;
+            }
+            QMessageBox QLabel {
+                color: #FFFFFF !important;
+                font-size: 13px;
+            }
+            QPushButton {
+                background-color: #007ACC;
+                color: #FFFFFF;
+                border: 1px solid #005A9E;
+                border-radius: 4px;
+                padding: 5px 20px;
+                font-weight: bold;
+                min-width: 60px;
+            }
+            QPushButton:hover {
+                background-color: #1C97EA;
+            }
+        """)
+
+    msg.exec()
 
 
 if __name__ == "__main__":
