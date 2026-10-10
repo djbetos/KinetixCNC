@@ -65,6 +65,22 @@ class ConfigManager:
     with open(self.config_path, "w", encoding="utf-8") as f:
       self.config.write(f)
 
+  # -------------------------------------------------------------------------
+  # METODAT PËR TOOL TABLE (0 - 49)
+  # -------------------------------------------------------------------------
+  def get_tool_param(self, tool_no: int, param: str, fallback: str = "0.0") -> str:
+      """Lexon një parametër të mjetit (p.sh. Info, X_offset, Diameter) nga .ini."""
+      section = f"TOOL_{tool_no}"
+      return self.config.get(section, param, fallback=fallback)
+
+  def set_tool_param(self, tool_no: int, param: str, value: str):
+      """Ruan parametrin e mjetit në skedarin .ini."""
+      section = f"TOOL_{tool_no}"
+      if not self.config.has_section(section):
+          self.config.add_section(section)
+      self.config.set(section, param, str(value))
+      self.save_config()
+
   def create_default_profile(self):
     """Krijon një profil standard nëse skedari .ini mungon."""
     self.config["GENERAL"] = {
@@ -206,4 +222,15 @@ class ConfigManager:
       self.config.add_section("MotionController")
 
     self.config.set("MotionController", "MaxFreq", str(val))
+    self.save_config()
+  
+  def get_business_name(self) -> str:
+    """Lexon emrin e biznesit nga skedari .ini."""
+    return self.config.get("GENERAL", "BusinessName", fallback="")
+
+  def set_business_name(self, name: str):
+    """Ruan emrin e biznesit në skedarin .ini."""
+    if not self.config.has_section("GENERAL"):
+         self.config.add_section("GENERAL")
+    self.config.set("GENERAL", "BusinessName", name.strip())
     self.save_config()

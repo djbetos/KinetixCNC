@@ -32,6 +32,8 @@ from ui.jog_mpg_dialog import JogMPGDialog
 from ui.motion_controller_dialog import MotionControllerDialog
 from ui.profile_selector import ProfileSelectorDialog
 from ui.setup_dialog import SetupDialog
+from ui.fixtures_dialog import FixturesDialog
+from ui.tooltable_dialog import ToolTableDialog
 
 
 class GCodeVisualizer3D(QWidget):
@@ -220,6 +222,48 @@ class MainWindow(QMainWindow):
 
     # Përditësojmë gjendjen e ndërfaqes për Enable / ESTOP
     self.update_enable_ui_state()
+
+  def action_open_fixtures_dialog(self):
+        from ui.fixtures_dialog import FixturesDialog
+        dlg = FixturesDialog(self.cfg, self)
+        dlg.exec()
+  def action_open_tooltable_dialog(self):
+        from ui.tooltable_dialog import ToolTableDialog
+        dlg = ToolTableDialog(self.cfg, self)
+        dlg.exec()
+  def action_open_safez_dialog(self):
+        from ui.safez_dialog import SafeZDialog
+        dlg = SafeZDialog(self.cfg, self)
+        dlg.exec()
+  def action_open_io_diagnostics(self):
+        from ui.io_diagnostics_dialog import IoDiagnosticsDialog
+        
+        # Ruajmë një referencë (self.io_diag_dlg) që dritarja të mos mbyllet menjëherë nga Garbage Collector
+        if not hasattr(self, "io_diag_dlg") or self.io_diag_dlg is None:
+            self.io_diag_dlg = IoDiagnosticsDialog(self.cfg, self)
+        
+        # Përdorim .show() në vend të .exec() që të mos bllokojë dritaren kryesore
+        self.io_diag_dlg.show()
+        self.io_diag_dlg.raise_()
+        self.io_diag_dlg.activateWindow()
+  def action_open_business_name_dialog(self):
+        from ui.business_name_dialog import BusinessNameDialog
+        dlg = BusinessNameDialog(self.cfg, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.refresh_business_banner()
+
+  def update_window_title(self):
+        """Përditëson titullin e dritares sipas kërkesës suaj."""
+        base_title = "Kinetix CNC"
+        
+        if self.cfg:
+            b_name = self.cfg.get_business_name()
+            if b_name:
+                base_title = f"Kinetix CNC - {b_name}"
+        
+        # Shtojmë pjesën tjetër standarde (Ether-MCI dhe Profile)
+        full_title = f"{base_title} - Ether-MCI | Profile: [{self.profile_name}]"
+        self.setWindowTitle(full_title)
 
   # -------------------------------------------------------------------------
   # LOGJIKA E ENABLE / DISABLE / ESTOP & OUTPUT PIN 24
@@ -421,9 +465,18 @@ class MainWindow(QMainWindow):
     act_setup = QAction("Setup...", self)
     act_setup.triggered.connect(self.action_open_setup_dialog)
 
+    # Shtimi i Fixtures...
     act_fixtures = QAction("Fixtures...", self)
+    act_fixtures.triggered.connect(self.action_open_fixtures_dialog)
+    config_menu.addAction(act_fixtures)
+
     act_tooltable = QAction("Tooltable...", self)
+    act_tooltable.triggered.connect(self.action_open_tooltable_dialog)
+    config_menu.addAction(act_tooltable)
+
     act_safez = QAction("SafeZ...", self)
+    act_safez.triggered.connect(self.action_open_safez_dialog)
+    config_menu.addAction(act_safez)
 
     config_menu.addAction(act_motion)
     config_menu.addAction(act_setup)
@@ -475,7 +528,10 @@ class MainWindow(QMainWindow):
     view_menu.addMenu(lang_menu)
 
     view_menu.addSeparator()
-    view_menu.addAction("IO Diagnostics")
+    act_io_diagnostics = QAction("IO Diagnostics", self)
+    act_io_diagnostics.triggered.connect(self.action_open_io_diagnostics)
+    view_menu.addAction(act_io_diagnostics)
+
     act_jog_mpg_window = QAction("Jog & MPG window", self)
     act_jog_mpg_window.triggered.connect(self.action_open_jog_mpg_window)
     view_menu.addAction(act_jog_mpg_window)
@@ -505,6 +561,10 @@ class MainWindow(QMainWindow):
     act_about = QAction("About Kinetix CNC", self)
     act_about.triggered.connect(self.action_show_about)
     about_menu.addAction(act_about)
+
+    act_business = QAction("Business Name...", self)
+    act_business.triggered.connect(self.action_open_business_name_dialog)
+    about_menu.addAction(act_business)  # <--- Këtu u ndryshua nga config_menu te about_menu
 
     # ==================== WIDGETI NË ANËN E DJATHTË TË MENUBAR ====================
     right_widget = QWidget()
@@ -745,59 +805,88 @@ class MainWindow(QMainWindow):
     self.update_axis_visibility()
     return mid_layout
 
+
   # -------------------------------------------------------------------------
   # PANELI 3: DJATHTAS (VISUALIZER 3D & MDI COMMANDS)
   # -------------------------------------------------------------------------
   def create_right_visualizer_panel(self):
-    right_layout = QVBoxLayout()
-    right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout = QVBoxLayout()
+        right_layout.setContentsMargins(0, 0, 0, 0)
 
-    self.visualizer = GCodeVisualizer3D()
-    right_layout.addWidget(self.visualizer, stretch=1)
+        # Header lart në të djathtë për Emrin e Biznesit (KINETIX CNC Euro-Model)
+        brand_layout = QHBoxLayout()
+        brand_layout.setContentsMargins(5, 0, 5, 5)
+        
+        self.lbl_banner_brand = QLabel("KINETIX CNC")
+        self.lbl_banner_brand.setStyleSheet("color: #007ACC; font-size: 15px; font-weight: bold;")
+        
+        self.lbl_banner_business = QLabel()
+        self.lbl_banner_business.setStyleSheet("color: #FFFFFF; font-size: 15px; font-weight: bold;")
+        
+        brand_layout.addWidget(self.lbl_banner_brand)
+        brand_layout.addWidget(self.lbl_banner_business)
+        brand_layout.addStretch()
+        
+        right_layout.addLayout(brand_layout)
 
-    views_layout = QHBoxLayout()
-    for view_name in ["All", "XY", "ZX", "YZ", "Iso"]:
-      btn_v = QPushButton(view_name)
-      btn_v.clicked.connect(
-          lambda _, m=view_name: self.visualizer.set_view_mode(m)
-          if self.visualizer is not None
-          else None
-      )
-      views_layout.addWidget(btn_v)
+        self.visualizer = GCodeVisualizer3D()
+        right_layout.addWidget(self.visualizer, stretch=1)
 
-    btn_soft = QPushButton("Soft\nlimits")
-    views_layout.addWidget(btn_soft)
-    views_layout.addStretch()
-    views_layout.addWidget(QPushButton("JogFollow"))
+        views_layout = QHBoxLayout()
+        for view_name in ["All", "XY", "ZX", "YZ", "Iso"]:
+            btn_v = QPushButton(view_name)
+            btn_v.clicked.connect(
+                lambda _, m=view_name: self.visualizer.set_view_mode(m)
+                if self.visualizer is not None
+                else None
+            )
 
-    right_layout.addLayout(views_layout)
+        bottom_bar = QHBoxLayout()
+        lbl_mdi = QLabel("MDI:")
+        self.txt_mdi = QLineEdit("G0 G17 G91.1")
 
-    bottom_bar = QHBoxLayout()
-    lbl_mdi = QLabel("MDI:")
-    self.txt_mdi = QLineEdit("G0 G17 G91.1")
+        bottom_bar.addWidget(lbl_mdi)
+        bottom_bar.addWidget(self.txt_mdi, stretch=1)
+        right_layout.addLayout(bottom_bar)
 
-    bottom_bar.addWidget(lbl_mdi)
-    bottom_bar.addWidget(self.txt_mdi, stretch=1)
-    right_layout.addLayout(bottom_bar)
+        actions_layout = QHBoxLayout()
+        actions_layout.addWidget(QPushButton("ATZ"))
 
-    actions_layout = QHBoxLayout()
-    actions_layout.addWidget(QPushButton("ATZ"))
+        btn_safez = QPushButton("Safe Z...")
+        actions_layout.addWidget(btn_safez)
 
-    btn_safez = QPushButton("Safe Z...")
-    actions_layout.addWidget(btn_safez)
+        btn_fixtures = QPushButton("Fixtures")
+        btn_fixtures.clicked.connect(self.action_open_fixtures_dialog) 
+        actions_layout.addWidget(btn_fixtures)
 
-    btn_fixtures = QPushButton("Fixtures...")
-    actions_layout.addWidget(btn_fixtures)
+        btn_setup = QPushButton("Setup")
+        btn_setup.clicked.connect(self.action_open_setup_dialog)
+        actions_layout.addWidget(btn_setup)
 
-    btn_setup = QPushButton("Setup...")
-    btn_setup.clicked.connect(self.action_open_setup_dialog)
-    actions_layout.addWidget(btn_setup)
+        btn_tool = QPushButton("ToolTable")
+        btn_tool.clicked.connect(self.action_open_tooltable_dialog)
+        actions_layout.addWidget(btn_tool)
 
-    actions_layout.addWidget(QPushButton("ToolOff..."))
-    actions_layout.addWidget(QPushButton("Tool table..."))
+        actions_layout.addWidget(QPushButton("ToolOff"))
 
-    right_layout.addLayout(actions_layout)
-    return right_layout
+        right_layout.addLayout(actions_layout)
+
+        # Thërrasim metodën për të shfaqur/fshehur emrin e biznesit në fillim
+        self.refresh_business_banner()
+
+        return right_layout
+
+  def refresh_business_banner(self):
+        """Lexon dhe shfaq emrin e biznesit në anën e djathtë lart."""
+        if hasattr(self, "cfg") and self.cfg:
+            b_name = self.cfg.get_business_name()
+            if b_name:
+                self.lbl_banner_business.setText(f"  {b_name}")
+                self.lbl_banner_brand.show()
+                self.lbl_banner_business.show()
+            else:
+                self.lbl_banner_brand.hide()
+                self.lbl_banner_business.hide()
 
   # -------------------------------------------------------------------------
   # LOGJIKA E DUKSHMËRISË SË AKSEVE NGA .INI
